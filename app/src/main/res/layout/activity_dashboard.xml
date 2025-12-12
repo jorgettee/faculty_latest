@@ -33,7 +33,6 @@
             android:layout_height="120dp"
             android:layout_below="@id/header_logo"
             android:layout_centerHorizontal="true"
-            android:layout_marginTop="16dp"
             android:scaleType="centerCrop"
             app:srcCompat="@drawable/ic_account_circle" />
         <TextView
@@ -64,7 +63,6 @@
             android:layout_height="70dp"
             android:text="Scan Face Again"
             android:textSize="20sp"
-            android:layout_marginTop="50dp"
             android:padding="16dp"
             android:fontFamily="@font/generalsans_regular"
             app:strokeColor="@color/dark_blue"
