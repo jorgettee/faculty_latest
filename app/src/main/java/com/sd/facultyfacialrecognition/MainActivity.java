@@ -1,0 +1,1217 @@
+package com.sd.facultyfacialrecognition;
+
+import android.Manifest;
+import android.bluetooth.BluetoothAdapter;
+import android.bluetooth.BluetoothDevice;
+import android.content.pm.PackageManager;
+import android.graphics.Bitmap;
+import android.graphics.Rect;
+import android.os.Build;
+import android.os.Bundle;
+import android.os.Environment;
+import android.os.Handler;
+import android.util.Log;
+import android.util.Size;
+import android.content.Intent;
+import android.view.View;
+import android.widget.Button;
+import android.widget.TextView;
+import android.widget.Toast;
+
+import androidx.annotation.NonNull;
+import androidx.annotation.OptIn;
+import androidx.appcompat.app.AppCompatActivity;
+import androidx.camera.core.CameraSelector;
+import androidx.camera.core.ExperimentalGetImage;
+import androidx.camera.core.ImageAnalysis;
+import androidx.camera.core.Preview;
+import androidx.camera.lifecycle.ProcessCameraProvider;
+import androidx.camera.view.PreviewView;
+import androidx.core.app.ActivityCompat;
+import androidx.core.content.ContextCompat;
+
+import com.google.common.util.concurrent.ListenableFuture;
+import com.google.firebase.firestore.FirebaseFirestore;
+import com.google.mlkit.vision.common.InputImage;
+import com.google.mlkit.vision.face.Face;
+import com.google.mlkit.vision.face.FaceDetection;
+import com.google.mlkit.vision.face.FaceDetector;
+import com.google.mlkit.vision.face.FaceDetectorOptions;
+import com.google.mlkit.vision.face.FaceLandmark;
+
+import org.json.JSONArray;
+import org.json.JSONObject;
+
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+
+import com.google.gson.Gson;
+import com.google.gson.reflect.TypeToken;
+import com.google.gson.reflect.TypeToken;
+
+import java.text.SimpleDateFormat;
+import java.util.Date;
+
+import com.google.firebase.database.DatabaseReference;
+import com.google.firebase.database.FirebaseDatabase;
+
+
+
+public class MainActivity extends BaseDrawerActivity {
+    private static final String TAG = "MainActivity";
+    private static final int REQUEST_CAMERA_PERMISSION = 1001;
+
+    private PreviewView previewView;
+    private FaceOverlayView overlayView;
+    private TextView statusTextView;
+    private TextView countdownTextView;
+    private Button confirmYesButton;
+    private Button confirmNoButton;
+    private Button btnBreakDone;
+
+    private FaceNet faceNet;
+    private ImageAligner imageAligner;
+    private ExecutorService cameraExecutor;
+
+    private final Map<String, float[]> KNOWN_FACE_EMBEDDINGS = new HashMap<>();
+    private Map<String, List<float[]>> facultyEmbeddings = new HashMap<>();
+
+    private float dynamicThreshold = 0.66f;
+
+    private static final int STABILITY_FRAMES_NEEDED = 7;
+    private static final long UNLOCK_COOLDOWN_MILLIS = 10000;
+
+    private static final long CONFIRMATION_TIMEOUT_MILLIS = 10000;
+    private static final int VISUAL_COUNTDOWN_SECONDS = 5;
+
+    private String stableMatchName = "Scanning...";
+    private String currentBestMatch = "Scanning...";
+    private int stableMatchCount = 0;
+    private String lastMatchName = "";
+
+    private boolean isDoorLocked = true;
+    private boolean isAwaitingLockConfirmation = false;
+    private boolean isAwaitingUnlockConfirmation = false;
+    private boolean isAwaitingLockerRecognition = false;
+    private boolean isReturningFromBreak = false;
+
+    private String authorizedLocker = null;
+    private String authorizedUnlocker = null;
+    private long lastLockTimestamp = 0;
+
+    private Handler confirmationHandler;
+    private Runnable confirmationRunnable;
+    private Handler countdownDisplayHandler;
+    private Runnable countdownDisplayRunnable;
+    private int confirmationTimeRemaining = VISUAL_COUNTDOWN_SECONDS;
+    private FirebaseFirestore db;
+    private BluetoothAdapter bluetoothAdapter;
+    private BluetoothService bluetoothService;
+    private BluetoothDevice bluetoothDevice;
+
+    private String currentLab = "CpeLab";
+
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        setContentViewWithDrawer(R.layout.activity_main);
+
+        previewView = findViewById(R.id.previewView);
+        overlayView = findViewById(R.id.faceOverlayView);
+        statusTextView = findViewById(R.id.text_status_label);
+        countdownTextView = findViewById(R.id.text_countdown_status);
+
+        confirmYesButton = findViewById(R.id.confirm_yes_button);
+        confirmNoButton = findViewById(R.id.confirm_no_button);
+        btnBreakDone = findViewById(R.id.btn_break_done);
+
+        confirmYesButton.setVisibility(View.GONE);
+        confirmNoButton.setVisibility(View.GONE);
+        btnBreakDone.setVisibility(View.GONE);
+
+        confirmationHandler = new Handler();
+        countdownDisplayHandler = new Handler();
+        cameraExecutor = Executors.newSingleThreadExecutor();
+        imageAligner = new ImageAligner();
+
+
+        initializeSystem();
+        startCamera();
+        testLoadEmbeddings();
+
+        db = FirebaseFirestore.getInstance();
+
+        bluetoothAdapter = BluetoothAdapter.getDefaultAdapter();
+
+        String deviceName = "CpELab Door Lock";
+        String deviceAddress = "D4:E9:F4:E2:F8:02";
+
+        // Find paired device
+        bluetoothDevice = findPairedDevice(deviceName, deviceAddress);
+        if (bluetoothDevice == null) {
+            Log.e(TAG, "Bluetooth device not found!");
+            return;
+        }
+
+        bluetoothService = BluetoothServiceSingleton.getInstance(this, bluetoothDevice);
+
+
+    }
+
+    private BluetoothDevice findPairedDevice(String name, String address) {
+        if (bluetoothAdapter == null) return null;
+
+        // Check BLUETOOTH_CONNECT permission (required for Android 12+)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            if (ActivityCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT)
+                    != PackageManager.PERMISSION_GRANTED) {
+                Log.e(TAG, "BLUETOOTH_CONNECT permission not granted!");
+                // Optionally, you can request permission here using ActivityCompat.requestPermissions
+                return null;
+            }
+        }
+
+        for (BluetoothDevice device : bluetoothAdapter.getBondedDevices()) {
+            if ((name != null && device.getName().equals(name)) ||
+                    (address != null && device.getAddress().equals(address))) {
+                return device;
+            }
+        }
+        return null;
+    }
+
+    private void initializeSystem() {
+        try {
+            faceNet = new FaceNet(this, "facenet.tflite");
+
+            // Try loading from storage first
+            boolean embeddingsLoaded = loadEmbeddingsFromStorage();
+            if (!embeddingsLoaded) {
+                // Fallback to assets
+                embeddingsLoaded = loadEmbeddingsFromAssets();
+            }
+
+            Log.d(TAG, "FaceNet model and embeddings loaded successfully. Embeddings loaded: " + embeddingsLoaded);
+        } catch (Exception e) {
+            Log.e(TAG, "Error initializing FaceNet or embeddings", e);
+        }
+
+        startCamera();
+    }
+
+
+
+    private void startConfirmationTimer(boolean isLock) {
+        stopConfirmationTimer();
+
+        confirmationRunnable = () -> {
+            if (isLock) {
+                onConfirmNoClicked(null);
+                updateUiOnThread("Lock Timed Out", "Lock request cancelled due to inactivity.");
+            } else {
+                onConfirmNoClicked(null);
+                updateUiOnThread("Unlock Timed Out", "Unlock request cancelled due to inactivity.");
+            }
+        };
+
+        confirmationHandler.postDelayed(confirmationRunnable, CONFIRMATION_TIMEOUT_MILLIS);
+    }
+
+    private void stopConfirmationTimer() {
+        if (confirmationRunnable != null) {
+            confirmationHandler.removeCallbacks(confirmationRunnable);
+            confirmationRunnable = null;
+        }
+    }
+
+    private void startVisualCountdown(String action, String matchName) {
+        stopVisualCountdown();
+
+        confirmationTimeRemaining = VISUAL_COUNTDOWN_SECONDS;
+
+        countdownDisplayRunnable = new Runnable() {
+            @Override
+            public void run() {
+                String currentAction = isAwaitingLockConfirmation ? "Lock" : "Unlock";
+
+                if (confirmationTimeRemaining > 0) {
+                    String name = isAwaitingLockConfirmation ? authorizedLocker : stableMatchName;
+
+                    updateUiOnThread("Confirm " + currentAction + " Identity",
+                            "Is this you: " + name + "?\nAction auto-cancels in " + (CONFIRMATION_TIMEOUT_MILLIS / 1000) + "s (Visual countdown: " + confirmationTimeRemaining + "s).");
+
+                    confirmationTimeRemaining--;
+                    countdownDisplayHandler.postDelayed(this, 1000);
+                } else {
+                    String name = isAwaitingLockConfirmation ? authorizedLocker : stableMatchName;
+                    String finalStatus = isAwaitingLockConfirmation ? "Confirm Lock Identity" : "Confirm Unlock Identity";
+                    String finalCountdown = "Is this you: " + name + "? (Awaiting confirmation)";
+                    updateUiOnThread(finalStatus, finalCountdown);
+                    stopVisualCountdown();
+                }
+            }
+        };
+
+        countdownDisplayHandler.post(countdownDisplayRunnable);
+    }
+
+    private void stopVisualCountdown() {
+        if (countdownDisplayRunnable != null) {
+            countdownDisplayHandler.removeCallbacks(countdownDisplayRunnable);
+            countdownDisplayRunnable = null;
+        }
+    }
+
+    public void onConfirmYesClicked(View view) {
+        stopConfirmationTimer();
+        stopVisualCountdown();
+
+        if (isAwaitingLockConfirmation) {
+            handleLockConfirmation();
+
+        } else if (isAwaitingUnlockConfirmation) {
+            handleUnlockConfirmation();
+        }
+    }
+
+    private String getCurrentTimestamp() {
+        SimpleDateFormat sdf = new SimpleDateFormat("yyyy-MM-dd | EEEE | HH:mm:ss", Locale.getDefault());
+        return sdf.format(new Date());
+    }
+
+    private void updateRealtimeStatus(String facultyStatus, String doorStatus) {
+        if (authorizedUnlocker == null ||
+                authorizedUnlocker.equals("Scanning...") ||
+                authorizedUnlocker.equals("Unknown")) {
+            Log.w("DoorDebug", "Skipping Realtime DB update: unauthorized or unknown faculty.");
+            return;
+        }
+
+        String timestamp = new SimpleDateFormat("yyyy-MM-dd | EEEE | HH:mm:ss", Locale.getDefault())
+                .format(new Date());
+
+        Map<String, Object> data = new HashMap<>();
+        data.put("facultyStatus", facultyStatus);
+        data.put("facultyName", authorizedUnlocker);
+        data.put("doorStatus", doorStatus);
+        data.put("timestamp", timestamp);
+
+        try {
+            FirebaseDatabase database = FirebaseDatabase.getInstance(
+                    "https://facultyfacialrecognition-default-rtdb.asia-southeast1.firebasedatabase.app/"
+            );
+
+            DatabaseReference dbRef = database
+                    .getReference(currentLab)
+                    .child("Latest");
+
+            dbRef.setValue(data)
+                    .addOnSuccessListener(aVoid -> Log.d("DoorDebug", "Realtime DB successfully updated"))
+                    .addOnFailureListener(e -> Log.e("DoorDebug", "Realtime DB update FAILED", e));
+
+
+        } catch (Exception e) {
+            Log.e("DoorDebug", "Database initialization error", e);
+        }
+    }
+
+
+    private void logDoorEvent(String facultyName, String facultyStatus, String doorStatus) {
+        if (facultyName == null || facultyName.equals("Scanning...") || facultyName.equals("Unknown")) {
+            Log.w("DoorLockDebug", "Skipping logging: invalid faculty name");
+            return;
+        }
+
+        String timestamp = getCurrentTimestamp();
+
+        Map<String, Object> logEntry = new HashMap<>();
+        logEntry.put("facultyName", facultyName);
+        logEntry.put("facultyStatus", facultyStatus);
+        logEntry.put("doorStatus", doorStatus);
+        logEntry.put("timestamp", timestamp);
+        logEntry.put("lab", currentLab);
+
+        db.collection("DoorLogs")
+                .add(logEntry)
+                .addOnSuccessListener(docRef -> Log.d("DoorLockDebug",
+                        "Door event logged: " + facultyName + " | " + facultyStatus + " | " + doorStatus + " | " + timestamp))
+                .addOnFailureListener(e -> Log.e("DoorLockDebug", "Error logging door event", e));
+
+        updateLabStatus(facultyName, facultyStatus, doorStatus, timestamp);
+    }
+
+    private void updateLabStatus(String facultyName, String facultyStatus, String doorStatus, String timestamp) {
+        if (facultyName == null || facultyName.equals("Scanning...") || facultyName.equals("Unknown")) return;
+
+        Map<String, Object> data = new HashMap<>();
+        data.put("facultyName", facultyName);   // store the name
+        data.put("facultyStatus", facultyStatus);
+        data.put("doorStatus", doorStatus);
+        data.put("timestamp", timestamp);
+
+        db.collection(currentLab)
+                .document("Latest")   // Always overwrite the same document
+                .set(data)
+                .addOnSuccessListener(aVoid -> Log.d("DoorLockDebug",
+                        "Updated " + currentLab + " Latest: " + facultyName + " | " + facultyStatus + " | " + doorStatus + " | " + timestamp))
+                .addOnFailureListener(e -> Log.e("DoorLockDebug",
+                        "Error updating " + currentLab + " Latest", e));
+    }
+
+
+    private void handleLockConfirmation() {
+        isDoorLocked = true;
+        isAwaitingLockConfirmation = false;
+        isAwaitingLockerRecognition = false;
+        lastLockTimestamp = System.currentTimeMillis();
+
+        BluetoothService service = BluetoothServiceSingleton.getInstance();
+        if (service != null && service.isConnected()) {
+            service.sendDoorStatus("LOCKED");
+        }
+
+        final String facultyNameFinal = authorizedLocker; // make final for lambda
+        final String status = "LOCKED";
+
+        Log.d("DoorLockDebug", "Handling LOCK confirmation for faculty: " + facultyNameFinal);
+
+        // Log door event
+        logDoorEvent(authorizedLocker, "End Class", "LOCKED");
+
+        // Update Firestore with debug
+        updateFacultyStatusWithDebug(facultyNameFinal, status);
+
+        resetStateAfterAction();
+        updateUiOnThread("System Locked", "Door secured. Cooldown active.");
+    }
+
+    private void handleUnlockConfirmation() {
+        isDoorLocked = false;
+        isAwaitingUnlockConfirmation = false;
+        final String facultyNameFinal = stableMatchName;
+        authorizedUnlocker = facultyNameFinal;
+
+        BluetoothService service = BluetoothServiceSingleton.getInstance();
+        if (service != null && service.isConnected()) {
+            service.sendDoorStatus("UNLOCKED");
+        }
+
+        String facultyStatus = "In Class";
+        String doorStatus = "UNLOCKED";
+        String timestamp = new SimpleDateFormat("yyyy-MM-dd | EEEE | HH:mm:ss", Locale.getDefault()).format(new Date());
+
+        Log.d("DoorLockDebug", "Handling UNLOCK confirmation for faculty: " + facultyNameFinal);
+
+        // Firestore logs
+        logDoorEvent(facultyNameFinal, facultyStatus, doorStatus);
+
+        // Firestore lab status update
+        updateLabStatus(facultyNameFinal, facultyStatus, doorStatus, timestamp);
+
+        // Realtime Database update
+        updateRealtimeStatus(facultyStatus, doorStatus);
+
+        if (cameraExecutor != null) {
+            cameraExecutor.shutdown();
+        }
+
+        boolean isRescanMode = getIntent().hasExtra("mode") &&
+                "rescan".equals(getIntent().getStringExtra("mode"));
+        boolean isFromBreak = getIntent().getBooleanExtra("from_break", false);
+
+        if (isRescanMode) {
+            runOnUiThread(() -> {
+                if (isFromBreak) {
+                    findViewById(R.id.btn_break_done).setVisibility(View.VISIBLE);
+                } else {
+                    findViewById(R.id.btn_take_break).setVisibility(View.VISIBLE);
+                    findViewById(R.id.btn_end_class).setVisibility(View.VISIBLE);
+                }
+                findViewById(R.id.confirm_yes_button).setVisibility(View.GONE);
+                findViewById(R.id.confirm_no_button).setVisibility(View.GONE);
+
+                updateUiOnThread("What would you like to do?", "Select an option below.");
+            });
+
+            resetStateAfterAction();
+            return;
+        }
+
+        Intent intent = new Intent(MainActivity.this, DashboardActivity.class);
+        intent.putExtra("profName", facultyNameFinal);
+        startActivity(intent);
+
+        resetStateAfterAction();
+        updateUiOnThread("Access Granted:\n" + facultyNameFinal,
+                "Door UNLOCKED. Choose options below.");
+    }
+
+
+    // New method with detailed debug logging
+    private void updateFacultyStatusWithDebug(String facultyName, String status) {
+        if (facultyName == null || facultyName.equals("Scanning...") || facultyName.equals("Unknown")) {
+            Log.e("DoorLockDebug", "Skipping Firestore update: invalid faculty name '" + facultyName + "'");
+            return;
+        }
+
+        final String facultyNameFinal = facultyName;
+        final String statusFinal = status;
+
+        Log.d("DoorLockDebug", "Updating Firestore for faculty: " + facultyNameFinal + " with status: " + statusFinal);
+
+        Map<String, Object> data = new HashMap<>();
+        data.put("status", statusFinal); // will be "LOCKED", "UNLOCKED", or "BREAK"
+        data.put("timestamp", System.currentTimeMillis());
+
+        db.collection(currentLab)
+                .document(facultyNameFinal)
+                .set(data)
+                .addOnSuccessListener(aVoid -> Log.d("DoorLockDebug", "Successfully updated faculty status for " + facultyNameFinal))
+                .addOnFailureListener(e -> Log.e("DoorLockDebug", "Error updating faculty status for " + facultyNameFinal, e));
+    }
+
+    public void onTakeBreakClicked(View view) {
+        if (authorizedUnlocker == null) return;
+
+        String facultyNameFinal = authorizedUnlocker;
+        String facultyStatus = "Break";
+        String doorStatus = "UNLOCKED";
+        String timestamp = new SimpleDateFormat("yyyy-MM-dd | EEEE | HH:mm:ss", Locale.getDefault()).format(new Date());
+
+        Log.d("DoorLockDebug", "Professor taking break: " + facultyNameFinal);
+
+        logDoorEvent(facultyNameFinal, facultyStatus, doorStatus);
+        updateLabStatus(facultyNameFinal, facultyStatus, doorStatus, timestamp);
+        updateRealtimeStatus(facultyStatus, doorStatus);
+
+        // Navigate to dashboard
+        Intent intent = new Intent(MainActivity.this, DashboardActivity.class);
+        intent.putExtra("profName", facultyNameFinal);
+        intent.putExtra("status", "Professor is on break. Please scan to resume class.");
+        startActivity(intent);
+        finish();
+    }
+
+
+
+    public void onBackInClassScanned() {
+        stableMatchCount = 0;
+        authorizedUnlocker = null;
+        stableMatchName = "Scanning...";
+        currentBestMatch = "Scanning...";
+        updateUiOnThread("Professor Back in Class", "Please scan to confirm identity.");
+    }
+
+    public void onEndClassClicked(View view) {
+        if (authorizedUnlocker == null) return;
+
+        isAwaitingLockerRecognition = true;
+        stableMatchCount = 0;
+
+        String facultyNameFinal = authorizedUnlocker;
+        String facultyStatus = "End Class";
+        String doorStatus = "LOCKED";
+        String timestamp = new SimpleDateFormat("yyyy-MM-dd | EEEE | HH:mm:ss", Locale.getDefault()).format(new Date());
+
+        BluetoothService service = BluetoothServiceSingleton.getInstance();
+        if (service != null && service.isConnected()) {
+            service.sendDoorStatus("LOCKED");
+        }
+
+        Log.d("DoorLockDebug", "Class ended by: " + facultyNameFinal);
+
+        // Firestore logging
+        logDoorEvent(facultyNameFinal, facultyStatus, doorStatus);
+        updateLabStatus(facultyNameFinal, facultyStatus, doorStatus, timestamp);
+
+        // Realtime Database update
+        updateRealtimeStatus(facultyStatus, doorStatus);
+
+        isDoorLocked = true;
+
+        Intent intent = new Intent(MainActivity.this, ThankYouActivity.class);
+        intent.putExtra("message", "Class ended and door is locked, thank you!");
+        startActivity(intent);
+        finish();
+    }
+
+
+
+    public void onBreakDoneClicked(View view) {
+        if (authorizedUnlocker == null) return;
+
+        isReturningFromBreak = true;
+
+        String facultyStatus = "In Class";
+        String doorStatus = "UNLOCKED";
+
+        // Realtime Database update
+        updateRealtimeStatus(facultyStatus, doorStatus);
+
+        Intent intent = new Intent(MainActivity.this, DashboardActivity.class);
+        intent.putExtra("profName", authorizedUnlocker);
+        startActivity(intent);
+        finish();
+    }
+
+
+
+    public void onConfirmNoClicked(View view) {
+        stopConfirmationTimer();
+        stopVisualCountdown();
+
+        if (isAwaitingLockConfirmation) {
+            isAwaitingLockConfirmation = false;
+            isAwaitingLockerRecognition = false;
+            authorizedLocker = null;
+
+            if (view != null) {
+                updateUiOnThread("Access Granted: " + authorizedUnlocker, "Lock cancelled by user. Door is UNLOCKED.");
+            }
+
+        } else if (isAwaitingUnlockConfirmation) {
+            isAwaitingUnlockConfirmation = false;
+
+            if (view != null) {
+                updateUiOnThread("Access Denied", "Unlock cancelled by user. Awaiting recognition.");
+            }
+        }
+
+        stableMatchCount = 0;
+        stableMatchName = "Scanning...";
+        currentBestMatch = "Scanning...";
+    }
+
+    private void resetStateAfterAction() {
+        stableMatchCount = 0;
+        authorizedLocker = null;
+        stableMatchName = "Scanning...";
+        currentBestMatch = "Scanning...";
+    }
+
+    private boolean allPermissionsGranted() {
+        return ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
+                == PackageManager.PERMISSION_GRANTED;
+    }
+
+    private void startCamera() {
+        BluetoothService bt = BluetoothServiceSingleton.getInstance();
+        ListenableFuture<ProcessCameraProvider> cameraProviderFuture = ProcessCameraProvider.getInstance(this);
+        cameraProviderFuture.addListener(() -> {
+            try {
+                ProcessCameraProvider cameraProvider = cameraProviderFuture.get();
+                bindPreviewAndAnalyzer(cameraProvider);
+            } catch (ExecutionException | InterruptedException e) {
+                Log.e(TAG, "Camera provider error", e);
+            }
+        }, ContextCompat.getMainExecutor(this));
+    }
+
+    public void checkBluetoothBeforeCamera() {
+        BluetoothService bt = BluetoothServiceSingleton.getInstance();
+        if (bt == null || !bt.isConnected()) {
+            statusTextView.setText("Bluetooth not connected. Please connect to the Door Lock.");
+            Log.e("Camera", "Camera blocked: Bluetooth not connected.");
+            return;
+        }
+        startCamera(); // call your existing camera initialization
+    }
+
+
+    @OptIn(markerClass = ExperimentalGetImage.class)
+    private void bindPreviewAndAnalyzer(ProcessCameraProvider cameraProvider) {
+        cameraProvider.unbindAll();
+
+        Preview preview = new Preview.Builder().build();
+        CameraSelector selector = CameraSelector.DEFAULT_FRONT_CAMERA;
+        preview.setSurfaceProvider(previewView.getSurfaceProvider());
+
+        ImageAnalysis imageAnalysis = new ImageAnalysis.Builder()
+                .setTargetResolution(new Size(640, 480))
+                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                .build();
+
+        FaceDetectorOptions options = new FaceDetectorOptions.Builder()
+                .setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_ACCURATE)
+                .setLandmarkMode(FaceDetectorOptions.LANDMARK_MODE_ALL)
+                .setContourMode(FaceDetectorOptions.CONTOUR_MODE_ALL)
+                .setClassificationMode(FaceDetectorOptions.CLASSIFICATION_MODE_ALL)
+                .setMinFaceSize(0.30f)
+                .enableTracking()
+                .build();
+
+        FaceDetector detector = FaceDetection.getClient(options);
+
+        imageAnalysis.setAnalyzer(cameraExecutor, image -> {
+            try {
+                final android.media.Image mediaImage = image.getImage();
+                if (mediaImage != null) {
+                    InputImage inputImage = InputImage.fromMediaImage(mediaImage, image.getImageInfo().getRotationDegrees());
+                    detector.process(inputImage)
+                            .addOnSuccessListener(faces -> handleFaces(faces, inputImage))
+                            .addOnFailureListener(e -> Log.e(TAG, "Face detection failed", e))
+                            .addOnCompleteListener(task -> image.close());
+                } else {
+                    image.close();
+                }
+            } catch (Exception e) {
+                Log.e(TAG, "Analyzer error", e);
+                image.close();
+            }
+        });
+
+        cameraProvider.bindToLifecycle(this, selector, preview, imageAnalysis);
+    }
+
+    private void handleFaces(List<Face> faces, InputImage inputImage) {
+
+        Bitmap fullBmp = InputImageUtils.getBitmapFromInputImage(this, inputImage);
+        if (fullBmp == null) {
+            // If the bitmap couldn't be created, stop.
+            updateUiOnThread("System Ready", "Point camera at face.");
+            return;
+        }
+
+        Face bestFace = null;
+
+        if (faces.isEmpty()) {
+            // No faces detected, reset UI and stop.
+            currentBestMatch = "Scanning...";
+            updateUiOnThread("System Ready", "Point camera at face.");
+            runOnUiThread(() -> overlayView.setFaces(new ArrayList<>())); // Clear any old boxes
+            return;
+        } else if (faces.size() > 1) {
+            // --- THIS IS THE NEW LOGIC FOR MULTIPLE FACES ---
+            // Find the face closest to the center of the preview.
+            float minDistance = Float.MAX_VALUE;
+            int screenCenterX = previewView.getWidth() / 2;
+            int screenCenterY = previewView.getHeight() / 2;
+
+            for (Face face : faces) {
+                Rect boundingBox = face.getBoundingBox();
+                float distance = (float) Math.sqrt(
+                        Math.pow(boundingBox.centerX() - screenCenterX, 2) +
+                                Math.pow(boundingBox.centerY() - screenCenterY, 2)
+                );
+
+                if (distance < minDistance) {
+                    minDistance = distance;
+                    bestFace = face;
+                }
+            }
+        } else {
+            // Only one face was detected, so it's the best one.
+            bestFace = faces.get(0);
+        }
+
+        if (bestFace == null) {
+            // If no best face was determined, stop.
+            return;
+        }
+
+        // --- FROM HERE ON, WE USE 'bestFace' FOR EVERYTHING ---
+
+        if (bluetoothService == null || !bluetoothService.isConnected()) {
+            // Stop the camera immediately
+            if (cameraExecutor != null) {
+                cameraExecutor.shutdownNow();
+                cameraExecutor = null;
+            }
+            runOnUiThread(() -> statusTextView.setText("Door Lock disconnected.\nFace Recognition stopped."));
+            Log.w(TAG, "Door Lock disconnected.\nStopping camera and face recognition.");
+            return; // Exit the method, no further processing
+        }
+
+        // 1. PERFORM QUALITY CHECKS ON THE BEST FACE
+        Float leftEyeOpenProb = bestFace.getLeftEyeOpenProbability();
+        Float rightEyeOpenProb = bestFace.getRightEyeOpenProbability();
+        if ((leftEyeOpenProb != null && leftEyeOpenProb < 0.4) || (rightEyeOpenProb != null && rightEyeOpenProb < 0.4)) {
+            updateUiOnThread("Face Unclear", "Please keep your eyes open.");
+            runOnUiThread(() -> overlayView.setFaces(new ArrayList<>()));
+            return;
+        }
+
+        float headY = bestFace.getHeadEulerAngleY();
+        float acceptableAngle = 70.0f;
+        if (Math.abs(headY) > acceptableAngle) {
+            updateUiOnThread("Face Not Centered", "Please look towards the camera.");
+            runOnUiThread(() -> overlayView.setFaces(new ArrayList<>()));
+            return;
+        }
+
+        // 2. ALIGN AND RECOGNIZE THE BEST FACE
+        String currentBestFrameMatch = "Scanning...";
+        float bestDist = Float.MAX_VALUE;
+        List<FaceOverlayView.FaceGraphic> graphics = new ArrayList<>();
+
+        android.graphics.PointF leftEye = bestFace.getLandmark(FaceLandmark.LEFT_EYE) != null ? bestFace.getLandmark(FaceLandmark.LEFT_EYE).getPosition() : null;
+        android.graphics.PointF rightEye = bestFace.getLandmark(FaceLandmark.RIGHT_EYE) != null ? bestFace.getLandmark(FaceLandmark.RIGHT_EYE).getPosition() : null;
+        Bitmap faceBmp = imageAligner.alignAndCropFace(fullBmp, bestFace.getBoundingBox(), leftEye, rightEye);
+
+        if (faceBmp != null) {
+            float[] emb = faceNet.getEmbedding(faceBmp);
+            if (emb != null) {
+                normalizeEmbedding(emb);
+
+                for (Map.Entry<String, float[]> entry : KNOWN_FACE_EMBEDDINGS.entrySet()) {
+                    float d = FaceNet.distance(emb, entry.getValue());
+                    if (d < bestDist) {
+                        bestDist = d;
+                        currentBestFrameMatch = entry.getKey();
+                    }
+                }
+
+                if (bestDist > dynamicThreshold) {
+                    currentBestFrameMatch = "Unknown";
+                }
+            }
+        }
+
+        // 3. CREATE THE GRAPHIC FOR ONLY THE BEST FACE
+        String label = currentBestFrameMatch;
+        if (!currentBestFrameMatch.equals("Scanning...") && !currentBestFrameMatch.equals("Unknown")) {
+            label = String.format(Locale.US, "%s (%.2f)", currentBestFrameMatch, bestDist);
+        }
+        graphics.add(new FaceOverlayView.FaceGraphic(bestFace.getBoundingBox(), label, bestDist));
+
+        // --- THE REST OF YOUR EXISTING LOGIC STAYS THE SAME ---
+        this.currentBestMatch = currentBestFrameMatch;
+
+        String finalMessage = "";
+        String countdownMessage = "";
+
+        // (All your existing if/else logic for states like isAwaitingLockConfirmation, isDoorLocked, etc. goes here, unchanged)
+        // ...
+        // The caret position was here, so your existing logic starts from here
+        if (isAwaitingLockConfirmation || isAwaitingUnlockConfirmation) {
+
+            String authorizedName = isAwaitingLockConfirmation ? authorizedLocker : stableMatchName;
+
+            if (countdownDisplayRunnable == null) {
+                finalMessage = isAwaitingLockConfirmation ? "Confirm Lock Identity" : "Confirm Unlock Identity";
+                countdownMessage = "Is this you: " + authorizedName + "? (Awaiting confirmation)";
+            } else {
+                runOnUiThread(() -> overlayView.setFaces(graphics));
+                return;
+            }
+
+        } else if (isAwaitingLockerRecognition) {
+
+            updateStabilityState(currentBestFrameMatch);
+
+            if (stableMatchCount >= STABILITY_FRAMES_NEEDED) {
+
+                boolean isLockerIdentityConfirmed = !stableMatchName.equals("Unknown") &&
+                        !stableMatchName.equals("Scanning...") &&
+                        stableMatchName.equals(currentBestMatch);
+
+                if (isLockerIdentityConfirmed) {
+                    isAwaitingLockerRecognition = false;
+                    isAwaitingLockConfirmation = true;
+                    authorizedLocker = stableMatchName;
+                    stableMatchCount = 0;
+
+                    startConfirmationTimer(true);
+                    startVisualCountdown("Lock", authorizedLocker);
+
+                } else {
+                    isAwaitingLockerRecognition = false;
+                    finalMessage = "Recognition Failed";
+                    countdownMessage = "Lock initiation failed. Please try again.";
+                }
+            } else if (stableMatchCount > 0 && !currentBestFrameMatch.equals("Unknown") && !currentBestFrameMatch.equals("Scanning...")) {
+                int remainingFrames = STABILITY_FRAMES_NEEDED - stableMatchCount;
+                finalMessage = "Recognizing: " + currentBestMatch;
+                countdownMessage = String.format("Hold Steady to LOCK! (%d frames remaining)", remainingFrames);
+            } else {
+                finalMessage = "Awaiting Locker Recognition";
+                countdownMessage = "Please hold a faculty face steady for 5 seconds to initiate lock.";
+            }
+
+        } else if (isDoorLocked) {
+
+            long timeSinceLock = System.currentTimeMillis() - lastLockTimestamp;
+            if (timeSinceLock < UNLOCK_COOLDOWN_MILLIS) {
+                long remainingSeconds = (UNLOCK_COOLDOWN_MILLIS - timeSinceLock) / 1000 + 1;
+                finalMessage = "System Locked";
+                countdownMessage = String.format("Unlock Cooldown Active: %d seconds remaining.", remainingSeconds);
+
+                updateUiOnThread(finalMessage, countdownMessage);
+                runOnUiThread(() -> overlayView.setFaces(graphics));
+                return;
+            }
+
+            updateStabilityState(currentBestFrameMatch);
+
+            if (stableMatchCount >= STABILITY_FRAMES_NEEDED) {
+
+                boolean isUnlockIdentityConfirmed = !stableMatchName.equals("Unknown") &&
+                        !stableMatchName.equals("Scanning...") &&
+                        stableMatchName.equals(currentBestMatch);
+
+                if (isUnlockIdentityConfirmed) {
+                    isAwaitingUnlockConfirmation = true;
+                    stableMatchCount = 0;
+
+                    startConfirmationTimer(false);
+                    startVisualCountdown("Unlock", stableMatchName);
+
+                } else {
+                    finalMessage = "Access Denied";
+                    countdownMessage = "Recognition Failed. Please try again.";
+                    stableMatchCount = 0;
+                }
+            } else if (stableMatchCount > 0 && !currentBestFrameMatch.equals("Unknown") && !currentBestFrameMatch.equals("Scanning...")) {
+                int remainingFrames = STABILITY_FRAMES_NEEDED - stableMatchCount;
+                finalMessage = "Recognizing: " + currentBestMatch;
+                countdownMessage = String.format("Hold Steady for unlock! (%d frames remaining)", remainingFrames);
+            } else {
+                finalMessage = "Awaiting Recognition";
+                countdownMessage = "Scanning for faculty...";
+            }
+        } else {
+            finalMessage = "Access Granted: " + authorizedUnlocker;
+            countdownMessage = "Door UNLOCKED. Choose options below.";
+        }
+        // ... until the end of the method
+
+        updateUiOnThread(finalMessage, countdownMessage);
+
+        overlayView.setImageSourceInfo(inputImage.getWidth(), inputImage.getHeight(), true);
+        runOnUiThread(() -> overlayView.setFaces(graphics));
+    }
+
+
+    private synchronized void updateStabilityState(String newMatch) {
+        if (!newMatch.equals(lastMatchName)) {
+            stableMatchCount = 0;
+            lastMatchName = newMatch;
+        }
+        if (newMatch.equals(currentBestMatch)) {
+            stableMatchCount++;
+        } else {
+            currentBestMatch = newMatch;
+            stableMatchCount = 1;
+        }
+
+        if (stableMatchCount >= STABILITY_FRAMES_NEEDED) {
+            stableMatchName = currentBestMatch;
+        } else if (stableMatchCount == 0 || newMatch.equals("Scanning...")) {
+            stableMatchName = "Scanning...";
+        }
+    }
+
+    private void updateUiOnThread(final String status, final String countdown) {
+        runOnUiThread(() -> {
+            statusTextView.setText(status);
+            countdownTextView.setText(countdown);
+
+            if (isAwaitingLockConfirmation || isAwaitingUnlockConfirmation) {
+                confirmYesButton.setVisibility(View.VISIBLE);
+                confirmNoButton.setVisibility(View.VISIBLE);
+            } else {
+                confirmYesButton.setVisibility(View.GONE);
+                confirmNoButton.setVisibility(View.GONE);
+            }
+        });
+    }
+
+    private void normalizeEmbedding(float[] emb) {
+        float norm = 0;
+        for (float v : emb) norm += v * v;
+        norm = (float) Math.sqrt(norm);
+        if (norm > 0) {
+            for (int i = 0; i < emb.length; i++) emb[i] /= norm;
+        }
+    }
+
+    private boolean loadEmbeddingsFromAssets() {
+        try {
+            InputStream is = getAssets().open("embeddings.json");
+            String json = readStreamToString(is);
+            is.close();
+
+            // Parse JSON as Map<String, List<List<Double>>> first
+            Map<String, List<List<Double>>> temp = new Gson().fromJson(
+                    json,
+                    new TypeToken<Map<String, List<List<Double>>>>() {}.getType()
+            );
+
+            KNOWN_FACE_EMBEDDINGS.clear();
+
+            for (Map.Entry<String, List<List<Double>>> entry : temp.entrySet()) {
+                String name = entry.getKey();
+                List<List<Double>> embeddingsList = entry.getValue();
+
+                List<Double> firstEmb = embeddingsList.get(0);
+                float[] embArr = new float[firstEmb.size()];
+                for (int j = 0; j < firstEmb.size(); j++) {
+                    embArr[j] = firstEmb.get(j).floatValue();
+                }
+                KNOWN_FACE_EMBEDDINGS.put(name, embArr);
+            }
+
+            Log.i(TAG, "✅ Loaded embeddings from assets: " + KNOWN_FACE_EMBEDDINGS.size());
+            return true;
+
+        } catch (Exception e) {
+            Log.e(TAG, "Error loading embeddings from assets", e);
+            return false;
+        }
+    }
+
+
+    private boolean loadEmbeddingsFromStorage() {
+        try {
+            File embeddingsFile = new File(getExternalFilesDir("Pictures/FacultyPhotos"), "embeddings.json");
+            if (!embeddingsFile.exists()) {
+                Log.d(TAG, "Embeddings file does not exist");
+                return false;
+            }
+
+            String jsonStr = new String(Files.readAllBytes(embeddingsFile.toPath()), StandardCharsets.UTF_8);
+            JSONObject jsonObj = new JSONObject(jsonStr);
+
+            facultyEmbeddings.clear();
+            KNOWN_FACE_EMBEDDINGS.clear();
+
+            Iterator<String> keys = jsonObj.keys();
+            while (keys.hasNext()) {
+                String facultyName = keys.next();
+                JSONArray embeddingsArray = jsonObj.getJSONArray(facultyName);
+
+                if (embeddingsArray.length() == 0) continue;
+
+                // Store all embeddings in facultyEmbeddings
+                List<float[]> allEmbeddings = new ArrayList<>();
+                for (int i = 0; i < embeddingsArray.length(); i++) {
+                    JSONArray arr = embeddingsArray.getJSONArray(i);
+                    float[] emb = new float[arr.length()];
+                    for (int j = 0; j < arr.length(); j++) {
+                        emb[j] = (float) arr.getDouble(j);
+                    }
+                    allEmbeddings.add(emb);
+                }
+                facultyEmbeddings.put(facultyName, allEmbeddings);
+
+                // Compute the average embedding for KNOWN_FACE_EMBEDDINGS
+                int embSize = allEmbeddings.get(0).length;
+                float[] avgEmb = new float[embSize];
+                for (float[] emb : allEmbeddings) {
+                    for (int j = 0; j < embSize; j++) {
+                        avgEmb[j] += emb[j];
+                    }
+                }
+                for (int j = 0; j < embSize; j++) {
+                    avgEmb[j] /= allEmbeddings.size();
+                }
+
+                // Put only one key per person
+                KNOWN_FACE_EMBEDDINGS.put(facultyName, avgEmb);
+            }
+
+            Log.d(TAG, "✅ Embeddings loaded successfully from storage.");
+            Log.d(TAG, "Faculties loaded: " + facultyEmbeddings.keySet().size());
+            Log.d(TAG, "KNOWN_FACE_EMBEDDINGS loaded: " + KNOWN_FACE_EMBEDDINGS.size());
+
+            return true;
+
+        } catch (Exception e) {
+            Log.e(TAG, "Failed to load embeddings from storage", e);
+            return false;
+        }
+    }
+
+    private String readStreamToString(InputStream is) throws Exception {
+        StringBuilder sb = new StringBuilder();
+        byte[] buffer = new byte[1024];
+        int length;
+        while ((length = is.read(buffer)) != -1) {
+            sb.append(new String(buffer, 0, length, StandardCharsets.UTF_8));
+        }
+        return sb.toString();
+    }
+
+
+
+
+    private float computeDynamicThreshold(Map<String, float[]> embeddingsMap) {
+        List<Float> intraDists = new ArrayList<>();
+        List<Float> interDists = new ArrayList<>();
+
+        List<String> names = new ArrayList<>(embeddingsMap.keySet());
+
+        for (String name : names) {
+            float[] emb = embeddingsMap.get(name);
+            if (emb != null) {
+                float intra = simulateNoiseDistance(emb);
+                intraDists.add(intra);
+            }
+        }
+
+        for (int i = 0; i < names.size(); i++) {
+            for (int j = i + 1; j < names.size(); j++) {
+                float[] embA = embeddingsMap.get(names.get(i));
+                float[] embB = embeddingsMap.get(names.get(j));
+                if (embA != null && embB != null) {
+                    float d = FaceNet.distance(embA, embB);
+                    interDists.add(d);
+                }
+            }
+        }
+
+        float meanIntra = average(intraDists);
+        float meanInter = average(interDists);
+        float threshold = (meanIntra + meanInter) / 2;
+
+        Log.d("DynamicThreshold", "Mean Intra = " + meanIntra +
+                " | Mean Inter = " + meanInter +
+                " | Computed Threshold = " + threshold);
+
+        // Safety check (if somehow it fails)
+        if (threshold < 0.3f || threshold > 1.3f) threshold = 0.9f;
+
+        return threshold;
+    }
+
+    private float simulateNoiseDistance(float[] emb) {
+        float[] noisy = emb.clone();
+        for (int i = 0; i < noisy.length; i++) {
+            noisy[i] += (Math.random() - 0.5f) * 0.02f; // small random noise
+        }
+        return FaceNet.distance(emb, noisy);
+    }
+
+    private float average(List<Float> list) {
+        if (list == null || list.isEmpty()) return 0f;
+        float sum = 0f;
+        for (float v : list) sum += v;
+        return sum / list.size();
+    }
+
+    private void evaluateRecognitionAccuracy() {
+        if (KNOWN_FACE_EMBEDDINGS.size() < 2) {
+            Log.d("ModelAccuracy", "Not enough embeddings to evaluate.");
+            return;
+        }
+
+        int totalComparisons = 0;
+        int correctMatches = 0;
+
+        List<String> names = new ArrayList<>(KNOWN_FACE_EMBEDDINGS.keySet());
+        for (int i = 0; i < names.size(); i++) {
+            String nameA = names.get(i);
+            float[] embA = KNOWN_FACE_EMBEDDINGS.get(nameA);
+            if (embA == null) continue;
+
+            for (int j = 0; j < names.size(); j++) {
+                String nameB = names.get(j);
+                float[] embB = KNOWN_FACE_EMBEDDINGS.get(nameB);
+                if (embB == null) continue;
+
+                float distance = FaceNet.distance(embA, embB);
+                boolean samePerson = nameA.equals(nameB);
+                boolean recognized = distance < dynamicThreshold;
+
+                if ((recognized && samePerson) || (!recognized && !samePerson)) {
+                    correctMatches++;
+                }
+
+                totalComparisons++;
+            }
+        }
+
+        float accuracy = (float) correctMatches / totalComparisons * 100f;
+        Log.d("ModelAccuracy", String.format("Recognition Accuracy: %.2f%% (Threshold = %.3f)", accuracy, dynamicThreshold));
+    }
+
+    private void testLoadEmbeddings() {
+        try {
+            File embeddingsFile = new File(
+                    getExternalFilesDir(Environment.DIRECTORY_PICTURES),
+                    "FacultyPhotos/embeddings.json"
+            );
+
+            Log.d(TAG, "Embeddings file exists: " + embeddingsFile.exists());
+            Log.d(TAG, "Embeddings file path: " + embeddingsFile.getAbsolutePath());
+
+            if (!embeddingsFile.exists()) return;
+
+            FileInputStream fis = new FileInputStream(embeddingsFile);
+            String json = readStreamToString(fis);
+            fis.close();
+
+            Log.d(TAG, "JSON content snippet: " + json.substring(0, Math.min(json.length(), 200)) + "...");
+
+            // Try parsing as Map<String, List<List<Double>>>
+            Map<String, List<List<Double>>> temp = new Gson().fromJson(
+                    json,
+                    new TypeToken<Map<String, List<List<Double>>>>(){}.getType()
+            );
+
+            if (temp == null || temp.isEmpty()) {
+                Log.e(TAG, "Parsed JSON is null or empty!");
+                return;
+            }
+
+            for (Map.Entry<String, List<List<Double>>> entry : temp.entrySet()) {
+                String name = entry.getKey();
+                List<List<Double>> embeddingsList = entry.getValue();
+                Log.d(TAG, "Person: " + name + " | # of embeddings: " + embeddingsList.size());
+
+                if (!embeddingsList.isEmpty()) {
+                    List<Double> firstEmb = embeddingsList.get(0);
+                    Log.d(TAG, "First embedding sample: " + firstEmb.subList(0, Math.min(firstEmb.size(), 10)));
+                }
+            }
+
+        } catch (Exception e) {
+            Log.e(TAG, "Error testing embeddings load", e);
+        }
+    }
+
+    @Override
+    public void onBackPressed() {
+        Intent intent = new Intent(MainActivity.this, HomeActivity.class);
+        startActivity(intent);
+
+        super.onBackPressed();
+    }
+
+    @Override
+    protected void onDestroy() {
+        super.onDestroy();
+        stopConfirmationTimer();
+        stopVisualCountdown();
+        if (cameraExecutor != null) cameraExecutor.shutdown();
+        if (faceNet != null) faceNet.close();
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode, @NonNull String[] permissions,
+                                           @NonNull int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+
+        if (requestCode == REQUEST_CAMERA_PERMISSION) {
+            if (grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+                initializeSystem();
+            } else {
+                finish();
+            }
+        }
+    }
+
+}

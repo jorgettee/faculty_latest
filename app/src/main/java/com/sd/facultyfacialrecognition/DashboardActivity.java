@@ -1,0 +1,61 @@
+package com.sd.facultyfacialrecognition;
+
+import android.app.Activity;
+import android.content.Intent;
+import android.os.Bundle;
+import android.widget.Button;
+import android.widget.TextView;
+import androidx.appcompat.app.AppCompatActivity;
+
+public class DashboardActivity extends AppCompatActivity {
+
+    private TextView welcomeText;
+    private TextView statusText;
+    private Button scanAgainButton;
+    private String profName;
+
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        setContentView(R.layout.activity_dashboard);
+
+        profName = getIntent().getStringExtra("profName");
+
+        welcomeText = findViewById(R.id.text_welcome);
+        statusText = findViewById(R.id.text_status);
+        scanAgainButton = findViewById(R.id.btn_scan_again);
+
+        welcomeText.setText("Welcome, " + profName);
+
+        String status = getIntent().getStringExtra("status");
+        if (status == null) status = "Status: In Class";
+        statusText.setText(status);
+
+        scanAgainButton.setOnClickListener(v -> {
+            Intent intent = new Intent(DashboardActivity.this, MainActivity.class);
+            intent.putExtra("mode", "rescan");
+            intent.putExtra("profName", profName);
+            if (statusText.getText().toString().contains("on break")) {
+                intent.putExtra("from_break", true);
+            }
+            startActivity(intent);
+            finish();
+        });
+
+    }
+
+    @Override
+    public void onBackPressed() {
+        Intent intent = new Intent(DashboardActivity.this, DashboardActivity.class);
+
+        // Pass the current data so nothing resets
+        intent.putExtra("profName", profName);
+        intent.putExtra("status", statusText.getText().toString());
+
+        startActivity(intent);
+        finish();
+
+        super.onBackPressed(); // to satisfy Android Studio (won’t break anything)
+    }
+
+}
